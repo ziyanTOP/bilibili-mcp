@@ -22,6 +22,11 @@ from bilibili_api.video_uploader import (
 )
 from bilibili_api.utils.picture import Picture
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
+from bilibili_api.utils.network import Api
+from bilibili_api.utils.utils import get_api
+import aiohttp
+
+API = get_api("login")
 
 # ========== 初始化 ==========
 
@@ -47,6 +52,7 @@ def load_credential() -> Credential:
 # ========== 登录会话（进程级缓存） ==========
 
 _login_session: QrCodeLogin | None = None
+_qr_key: str | None = None
 
 
 def get_cred() -> Credential:
@@ -55,6 +61,32 @@ def get_cred() -> Credential:
     if not cred:
         raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
     return cred
+
+
+async def _fetch_cookies(url: str) -> dict:
+    """访问 crossDomain 链接并跟随重定向，收集 Set-Cookie 中的登录凭证"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://passport.bilibili.com/",
+        "Origin": "https://passport.bilibili.com",
+    }
+    cookies = {}
+
+    def _merge(set_cookie_headers):
+        for c in set_cookie_headers:
+            name, _, val = c.partition("=")
+            cookies[name.strip()] = val.split(";")[0]
+
+    async with aiohttp.ClientSession(headers=headers) as s:
+        # 不跟随重定向，取第一跳的 Set-Cookie（含 SESSDATA/bili_jct/DedeUserID）
+        async with s.get(url, allow_redirects=False) as r:
+            _merge(r.headers.getall("Set-Cookie", []))
+        # 再跟随重定向，补充 buvid3 等
+        async with s.get(url, allow_redirects=True) as r:
+            _merge(r.headers.getall("Set-Cookie", []))
+            for c in s.cookie_jar:
+                cookies[c.key] = c.value
+    return cookies
 
 
 # ========== Tool: 扫码登录（生成二维码） ==========
@@ -68,7 +100,7 @@ async def bili_login() -> str:
     Returns:
         包含二维码base64图片数据的JSON，前端可直接渲染为图片展示给用户
     """
-    global _login_session
+    global _login_session, _qr_key
 
     # 如果已有凭证，直接返回
     cred = load_credential()
@@ -81,6 +113,7 @@ async def bili_login() -> str:
     # 生成新的登录会话
     _login_session = QrCodeLogin()
     await _login_session.generate_qrcode()
+    _qr_key = _login_session._QrCodeLogin__qr_key
 
     # 获取二维码图片的 base64（无损PNG）
     pic = _login_session.get_qrcode_picture()
@@ -121,9 +154,9 @@ async def bili_login_check() -> str:
     Returns:
         当前登录状态
     """
-    global _login_session
+    global _qr_key
 
-    if not _login_session:
+    if not _qr_key:
         # 没有登录会话，检查是否已登录
         cred = load_credential()
         if cred:
@@ -136,48 +169,54 @@ async def bili_login_check() -> str:
             "message": "没有进行中的登录，请先调用 bili_login 生成二维码",
         }, ensure_ascii=False)
 
-    state = await _login_session.check_state()
+    # 新版 B站扫码登录：轮询成功后返回 crossDomain 链接，
+    # 需访问该链接并跟随重定向才能拿到 SESSDATA 等 cookie。
+    events = (
+        await Api(credential=Credential(), **API["qrcode"]["web"]["get_events"])
+        .update_params(qrcode_key=_qr_key)
+        .result
+    )
+    code = events.get("code")
 
-    if state == QrCodeLoginEvents.SCAN:
+    if code == 86101:
         return json.dumps({
             "status": "scanning",
-            "message": "已扫码，等待用户在手机上确认...",
-            "next_step": "请等待3秒后再次调用 bili_login_check",
+            "message": "等待扫码...",
+            "next_step": "请扫码后再次调用 bili_login_check",
         }, ensure_ascii=False)
 
-    elif state == QrCodeLoginEvents.CONF:
+    elif code == 86090:
         return json.dumps({
             "status": "confirming",
-            "message": "用户已确认，正在处理...",
-            "next_step": "请等待2秒后再次调用 bili_login_check",
+            "message": "已扫码，等待用户在手机上确认...",
+            "next_step": "请确认后再次调用 bili_login_check",
         }, ensure_ascii=False)
 
-    elif state == QrCodeLoginEvents.TIMEOUT:
-        _login_session = None
-        # 清理二维码文件
-        qr_file = Path(__file__).parent / "qrcode_login.png"
-        if qr_file.exists():
-            qr_file.unlink()
+    elif code == 86038:
+        _qr_key = None
         return json.dumps({
             "status": "timeout",
             "message": "二维码已过期，请重新调用 bili_login 生成新二维码",
         }, ensure_ascii=False)
 
-    elif state == QrCodeLoginEvents.DONE:
-        # 登录成功，保存凭证
-        cred = _login_session.get_credential()
+    elif code == 0:
+        # 登录成功，访问 crossDomain 链接换取 cookie 并保存凭证
+        url = events.get("url", "")
+        cookies = await _fetch_cookies(url)
+        sessdata = cookies.get("SESSDATA", "")
+        if not sessdata:
+            return json.dumps({
+                "status": "error",
+                "message": "登录成功但未能获取凭证，请重试",
+            }, ensure_ascii=False)
         with open(CRED_FILE, "w") as f:
             json.dump({
-                "sessdata": cred.sessdata,
-                "bili_jct": cred.bili_jct,
-                "buvid3": cred.buvid3,
-                "dedeuserid": cred.dedeuserid,
+                "sessdata": sessdata,
+                "bili_jct": cookies.get("bili_jct", ""),
+                "buvid3": cookies.get("buvid3", "") or "",
+                "dedeuserid": cookies.get("DedeUserID", ""),
             }, f)
-        _login_session = None
-        # 清理二维码文件
-        qr_file = Path(__file__).parent / "qrcode_login.png"
-        if qr_file.exists():
-            qr_file.unlink()
+        _qr_key = None
         return json.dumps({
             "status": "done",
             "message": "登录成功！凭证已保存，现在可以使用所有B站功能了",
@@ -185,7 +224,7 @@ async def bili_login_check() -> str:
 
     return json.dumps({
         "status": "unknown",
-        "message": f"未知状态: {state}",
+        "message": f"未知状态: code={code}",
     }, ensure_ascii=False)
 
 
