@@ -12,6 +12,7 @@ import json
 import base64
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
@@ -87,6 +88,14 @@ async def _fetch_cookies(url: str) -> dict:
             for c in s.cookie_jar:
                 cookies[c.key] = c.value
     return cookies
+
+
+def _fmt_ts(ts) -> str:
+    """把 Unix 时间戳格式化为本地时间字符串"""
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
 
 
 # ========== Tool: 扫码登录（生成二维码） ==========
@@ -1396,6 +1405,121 @@ async def bili_received_at_and_likes() -> str:
     except Exception as e:
         result["likes_error"] = str(e)
     return json.dumps(result, ensure_ascii=False)
+
+
+# ========== Tool 25: 观看历史 ==========
+
+@mcp.tool()
+async def bili_history(
+    num: int = 20,
+    type: str = "all",
+    max_id: int = 0,
+    view_at: int = 0,
+    business: str = "",
+) -> str:
+    """
+    获取当前登录账号的B站观看历史记录
+
+    Args:
+        num: 获取条数，默认20，最大50
+        type: 历史分类：all=全部 archive=视频 live=直播 article=专栏
+        max_id: 翻页游标，填上一次返回的 next.max（0 表示第一页）
+        view_at: 翻页游标，填上一次返回的 next.view_at（0 表示第一页）
+        business: 翻页游标，填上一次返回的 next.business
+
+    Returns:
+        JSON格式的历史记录列表（含 bvid/标题/UP主/进度/观看时间）及下一页游标
+    """
+    cred = get_cred()
+    num = max(1, min(int(num), 50))
+    type_map = {
+        "all": user.HistoryType.ALL,
+        "archive": user.HistoryType.archive,
+        "live": user.HistoryType.live,
+        "article": user.HistoryType.article,
+    }
+    ht = type_map.get(str(type).lower(), user.HistoryType.ALL)
+
+    def _dump(items, source, next_cursor):
+        return json.dumps({
+            "type": type,
+            "source": source,
+            "count": len(items),
+            "next": next_cursor,
+            "items": items,
+        }, ensure_ascii=False)
+
+    # 新版接口：支持分类 + 游标翻页
+    try:
+        kwargs = {"credential": cred, "_type": ht, "ps": num}
+        if max_id:
+            kwargs["max"] = int(max_id)
+        if view_at:
+            kwargs["view_at"] = int(view_at)
+        if business:
+            try:
+                kwargs["business"] = user.HistoryBusinessType(business)
+            except ValueError:
+                pass
+
+        result = await user.get_self_history_new(**kwargs)
+        items = []
+        for it in (result.get("list") or []):
+            h = it.get("history") or {}
+            items.append({
+                "bvid": h.get("bvid", ""),
+                "aid": h.get("oid", 0),
+                "title": it.get("title", ""),
+                "author": it.get("author_name", ""),
+                "author_uid": it.get("author_mid", 0),
+                "duration": it.get("duration", 0),
+                "progress": it.get("progress", 0),
+                "is_finish": bool(it.get("is_finish", 0)),
+                "tag": it.get("tag_name", ""),
+                "view_at": it.get("view_at", 0),
+                "view_time": _fmt_ts(it.get("view_at", 0)),
+                "uri": it.get("uri", ""),
+            })
+        cursor = result.get("cursor") or {}
+        return _dump(items, "new", {
+            "max": cursor.get("max", 0),
+            "view_at": cursor.get("view_at", 0),
+            "business": cursor.get("business", ""),
+            "has_more": bool(cursor.get("max")),
+        })
+    except Exception as e:
+        # 新版失败且无翻页游标时，回退到旧版接口（仅第一页）
+        if max_id or view_at:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        try:
+            legacy = await user.get_self_history(
+                page_num=1, per_page_item=num, credential=cred
+            )
+            items = []
+            for it in (legacy or []):
+                owner = it.get("owner") or {}
+                bvid = it.get("bvid", "")
+                items.append({
+                    "bvid": bvid,
+                    "aid": it.get("aid", 0),
+                    "title": it.get("title", ""),
+                    "author": owner.get("name", ""),
+                    "author_uid": owner.get("mid", 0),
+                    "duration": it.get("duration", 0),
+                    "progress": it.get("progress", 0),
+                    "tag": it.get("tname", ""),
+                    "view_at": it.get("view_at", 0),
+                    "view_time": _fmt_ts(it.get("view_at", 0)),
+                    "uri": it.get("short_link_v2", "")
+                    or (f"https://www.bilibili.com/video/{bvid}" if bvid else ""),
+                })
+            return _dump(items, "legacy", {
+                "max": 0, "view_at": 0, "business": "", "has_more": False,
+            })
+        except Exception as e2:
+            return json.dumps(
+                {"error": str(e), "fallback_error": str(e2)}, ensure_ascii=False
+            )
 
 
 # ========== 启动 ==========

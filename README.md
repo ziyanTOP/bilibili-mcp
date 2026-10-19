@@ -55,6 +55,7 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 |------|------|------|
 | `bili_favorite_lists` | 收藏夹列表 | 获取自己或他人的收藏夹 |
 | `bili_favorite_content` | 收藏夹内容 | 获取收藏夹内视频，支持搜索 |
+| `bili_history` | 观看历史 | 获取自己的B站观看历史，支持分类和游标翻页 |
 | `bili_send_message` | 发私信 | 给指定用户发送文字私信 |
 | `bili_unread_messages` | 未读消息 | 获取私信、@、回复、点赞等未读数 |
 | `bili_received_replies` | 收到的回复 | 获取评论回复通知 |
